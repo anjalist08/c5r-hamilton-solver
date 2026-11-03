@@ -153,6 +153,9 @@ def build_jobs(steps, deck, options):
         if job.source:
             uls = [ul for _, ul, _ in job.drops]
             job.loads = plan_loads(uls, job.start_volume, wells[job.source], options, max_ul) or [len(uls)]
+            if options.get("small_first") and len(job.loads) > 1:
+                # draw the small load first: the first aspirate is short and the reload is near
+                job.loads = sorted(job.loads)
     return jobs, moves
 
 

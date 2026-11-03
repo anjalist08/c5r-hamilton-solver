@@ -14,23 +14,55 @@ OUT = Path(__file__).resolve().parent.parent / "out"
 BEST = Path(__file__).resolve().parent.parent / "submissions"
 
 
+# Strategies tried for every protocol; the fastest valid program wins.
+CONFIGS = [
+    {},
+    {"split_mix": True},
+    {"small_first": True},
+    {"split_mix": True, "small_first": True},
+    {"premix": False},
+    {"multiload": False},
+]
+
+
 def solve(path, solver="ours"):
+    return best_program(path, solver)[0]
+
+
+def best_program(path, solver="ours"):
+    """(program, report, trace) of the fastest valid program over CONFIGS, else the starter's."""
     loaded = protocol.load(path)
     if solver == "starter":
-        return starter.solve(loaded, loaded["deck"])
-    return plan.solve(loaded, loaded["deck"])
+        program = starter.solve(loaded, loaded["deck"])
+        return (program, *grade.score(loaded, program))
+    best, seen, errors = None, set(), []
+    for config in CONFIGS:
+        try:
+            program = plan.solve(loaded, loaded["deck"], config)
+        except ValueError as error:
+            errors.append(f"{config}: {error}")
+            continue
+        if program in seen:
+            continue
+        seen.add(program)
+        report, trace = grade.score(loaded, program)
+        if report["valid"] and (best is None or report["seconds"] < best[1]["seconds"]):
+            best = (program, report, trace)
+    if best is None:
+        program = starter.solve(loaded, loaded["deck"])
+        best = (program, *grade.score(loaded, program))
+    return best
 
 
 def bench_one(path, solver):
     start = time.time()
     loaded = protocol.load(path)
     try:
-        program = solve(path, solver)
+        program, report, trace = best_program(path, solver)
     except ValueError as error:
         return loaded["id"], {"valid": False, "failures": [f"solver: {error}"]}, time.time() - start
     OUT.mkdir(exist_ok=True)
     (OUT / f"{loaded['id']}.txt").write_text(program)
-    report, trace = grade.score(loaded, program)
     (OUT / f"{loaded['id']}.trace.jsonl").write_text("".join(json.dumps(line) + "\n" for line in trace))
     (OUT / f"{loaded['id']}.report.json").write_text(json.dumps(report))
     return loaded["id"], report, time.time() - start
