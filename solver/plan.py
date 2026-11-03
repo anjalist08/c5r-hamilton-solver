@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 
 from speedrun import protocol
 from speedrun.robot import BELOW_SURFACE_MM, FLOOR_MM, Robot, split
@@ -283,6 +284,27 @@ class FastRobot(Robot):
             xs, ys, mask = lists(group, 1, 2)
             self.send("C0TP", f"xp{xs}yp{ys}tm{mask}tt{rack['define'][6:8]}tp{top:04d}tz{bottom:04d}th2450td1")
         return name
+
+    def program(self):
+        """The program, with heights raised where that saves the twin time (options["high"])."""
+        wires = list(self.wires)
+        rules = self.options.get("high", {"te_before_rack": True, "rack_th": True, "rack_te": True})
+        top = {}
+        tip = None
+        for i, wire in enumerate(wires):
+            op = wire[:4]
+            if op == "C0TP":
+                tip = wire[wire.index("tt") + 2 : wire.index("tt") + 4]
+            limit = 2476 if tip == "01" else 2923 if tip == "02" else 2450
+            nxt = wires[i + 1][:4] if i + 1 < len(wires) else ""
+            if op in ("C0AS", "C0DS") and rules.get("te_before_rack") and nxt in ("C0TR",):
+                wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
+            if op in ("C0TP", "C0TR") and rules.get("rack_th"):
+                wire = re.sub(r"th2450", f"th{limit}", wire, count=1)
+            if op == "C0TR" and rules.get("rack_te"):
+                wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
+            wires[i] = wire
+        return "".join(wire + "\n" for wire in wires)
 
     def drop(self, drops):
         """Dispense (channel, well, ul, mix, jet, empty) drops in as few commands as the arm allows."""
