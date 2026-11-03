@@ -250,7 +250,8 @@ class FastRobot(Robot):
             self.source.pop(channel, None)
             self.spot[channel] = (name, round(x * 10), round(y * 10))
         if rack["define"] not in self.defined:
-            self.send("C0TT", rack["define"][4:])
+            if not self.options.get("skip_tt"):
+                self.send("C0TT", rack["define"][4:])
             self.defined.add(rack["define"])
         top, bottom = round(rack["top_z_mm"] * 10), round((rack["top_z_mm"] - rack["stroke_mm"]) * 10)
         from speedrun.robot import lists
@@ -282,18 +283,20 @@ class FastRobot(Robot):
                     surface = self.bottom(ref) + self.height(ref)
                     zs.append(self.jet_z(ref, surface) if jet else self.floor(ref, mix and mix[0]))
                     volumes.append(plunger)
-                    modes[channel] = 4 if empty else 2
+                    modes[channel] = 4 if empty else (self.options.get("jet_dm", 2) if jet else 2)
                 fields = self.dispense_fields(group, zs, volumes, 2, mix)
                 dm = " ".join(str(modes.get(ch, next(iter(modes.values())))) for ch in range(8))
                 self.send("C0DS", fields.replace("dm2&", f"dm{dm}", 1))
 
     def jet_z(self, ref, surface):
-        mode = self.options.get("jet", "top")
-        if mode == "top":
-            plate = protocol.plates(self.deck)[ref.split(":")[0]]
-            top = self.origin[plate["name"]][2] + plate["size_mm"][2]
-            return math.ceil((max(top - self.options.get("rim_mm", 3.0), surface + 1.5)) * 10)
-        return math.ceil((surface + 1.5) * 10)
+        """Jet height: just inside the well's top (less Z travel), at least 1.5 mm above the liquid."""
+        if self.options.get("jet", "top") != "top":
+            return math.ceil((surface + 1.5) * 10)
+        plate = protocol.plates(self.deck)[ref.split(":")[0]]
+        well = self.wells[ref]
+        well_top = well["bottom_z_mm"] + well_depth(well)
+        top = self.origin[plate["name"]][2] + min(plate["size_mm"][2], well_top)
+        return math.ceil(max(top - self.options.get("rim_mm", 0.3), surface + 1.5) * 10)
 
     def eject(self, channels=None):
         """Drop tips in the waste, or by default put each back into the spot it came from."""
@@ -376,7 +379,7 @@ def pick_round(ready):
 
 def run_round(robot, jobs, channel_of):
     channels = sorted(channel_of[id(job)] for job in jobs)
-    need = max(job_ul(job) for job in jobs)
+    need = max(job_ul(job, robot.options.get("need_factor", 1.1)) for job in jobs)
     robot.pick_row_matched(channels, need)
     by_channel = {channel_of[id(job)]: job for job in jobs}
 
@@ -446,11 +449,18 @@ def aspirate(robot, channels, wells, loads):
         robot.send("C0AS", robot.aspirate_fields(group, zs, [p for *_, p, _ in group]))
 
 
-def job_ul(job):
+def well_depth(well):
+    profile = well.get("container_profile")
+    if profile:
+        return sum(segment["height_mm"] for segment in profile["segments"])
+    return well["capacity_microliters"] / well["area_mm2"]
+
+
+def job_ul(job, factor=1.1):
     if not job.source:
         return job.mix[0]
     biggest = max(sum(ul for _, ul, _ in job.drops[sum(job.loads[:i]) : sum(job.loads[: i + 1])]) for i in range(len(job.loads)))
-    return max(biggest * 1.1, job.mix[0] if job.mix else 0)
+    return max(biggest * factor, job.mix[0] if job.mix else 0)
 
 
 def group_by(items, key):
