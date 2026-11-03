@@ -17,6 +17,7 @@ from speedrun.robot import split
 COMMAND_S = 0.8 + 2.1  # overhead + first stop
 STOP_S = 2.5  # each extra X in one command
 ROUND_S = 10.0  # pickup + eject + their overhead
+NODE_BUDGET = 400  # exact channel-order search gives up after this many nodes
 
 
 def plan_rounds(pool, robot, greedy, iterations=20000, seed=7):
@@ -71,16 +72,97 @@ def anneal(rounds, where, iterations, rng):
     return rounds
 
 
+_cache = {}
+
+
 def round_cost(jobs, where):
-    """(estimated seconds, channel map) for the best of a few channel assignments."""
+    """(estimated seconds, channel map): an exact channel order with no split commands if one
+    exists, else the best of a few fixed orders (which may split)."""
     if not jobs:
         return 0.0, {}
-    best = None
-    for assign in assignments(jobs, where):
-        cost = phases_cost(jobs, assign, where)
-        if best is None or cost < best[0]:
-            best = (cost, assign)
-    return best
+    key = tuple(sorted(id(job) for job in jobs))
+    hit = _cache.get(key)
+    if hit is None:
+        order = exact_order(jobs, where)
+        if order is not None:
+            assign = {id(job): channel for channel, job in order}
+            hit = (phases_cost(jobs, assign, where), order)
+        else:
+            best = None
+            for assign in assignments(jobs, where):
+                cost = phases_cost(jobs, assign, where)
+                if best is None or cost < best[0]:
+                    best = (cost, [(assign[id(job)], job) for job in jobs])
+            hit = best
+        _cache[key] = hit
+    cost, order = hit
+    return cost, {id(job): channel for channel, job in order}
+
+
+def positions(job, where):
+    """(x, y) per phase: aspirate (source), then each drop target; mix-only jobs at their well."""
+    if not job.source:
+        return [where(job.well)]
+    return [where(job.source)] + [where(target) for target, _, _ in job.drops]
+
+
+def exact_order(jobs, where):
+    """Channels for jobs so that every phase is one command, or None.
+
+    At a shared X a lower channel must sit further back (larger Y) by at least
+    9 mm per channel step. So jobs sharing a column in any phase must keep
+    their back-to-front order (a precedence edge) and sit at most their row
+    gap apart. Channels are consecutive, so the search is over orders only.
+    """
+    pos = [positions(job, where) for job in jobs]
+    n = len(jobs)
+    before = [set() for _ in range(n)]  # before[j]: jobs that must come earlier
+    gap = {}  # (i, j) -> most channels apart
+    for i in range(n):
+        for j in range(i + 1, n):
+            direction, most = 0, 8
+            for (xi, yi), (xj, yj) in zip(pos[i], pos[j]):
+                if xi != xj:
+                    continue
+                d = 1 if yi > yj else -1
+                if yi == yj or (direction and d != direction):
+                    return None
+                direction = d
+                most = min(most, int((abs(yi - yj) + 1) // 90))
+            if direction:
+                first, second = (i, j) if direction > 0 else (j, i)
+                before[second].add(first)
+                gap[(first, second)] = most
+    placed, slot_of = [], {}
+    budget = [NODE_BUDGET]
+
+    def search():
+        if len(placed) == n:
+            return True
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        slot = len(placed)
+        for i in range(n):
+            if i in slot_of or not before[i] <= slot_of.keys():
+                continue
+            if any(slot - slot_of[j] > gap[(j, i)] for j in before[i]):
+                continue
+            # a later job that must follow a placed one cannot fall too far behind it
+            if any(k not in slot_of and (j, k) in gap and slot + 1 - slot_of[j] > gap[(j, k)]
+                   for j in slot_of for k in range(n) if k != i and (j, k) in gap):
+                continue
+            placed.append(i)
+            slot_of[i] = slot
+            if search():
+                return True
+            placed.pop()
+            del slot_of[i]
+        return False
+
+    if search():
+        return [(channel, jobs[i]) for channel, i in enumerate(placed)]
+    return None
 
 
 def assignments(jobs, where):
