@@ -104,7 +104,7 @@ def build_jobs(steps, deck, options):
             if any(attached.get(t) == i for t in attached):
                 continue
             job = Job(None, i)
-            job.mix, job.mix_well = (step["ul"], step["cycles"]), step["well"]
+            job.mix, job.mix_well = (mix_ul(step, options), step["cycles"]), step["well"]
             jobs.append(job)
             owner[i] = job
             for ref in protocol.touches(step)[0]:
@@ -122,7 +122,7 @@ def build_jobs(steps, deck, options):
             jobs.append(job)
             if i in premix:
                 m = premix[i]
-                job.premix = (steps[m]["ul"], steps[m]["cycles"])
+                job.premix = (mix_ul(steps[m], options), steps[m]["cycles"])
                 job.steps.add(m)
                 owner[m] = job
         job.drops.append((target, step["ul"], i))
@@ -130,7 +130,7 @@ def build_jobs(steps, deck, options):
         owner[i] = job
         if i in attached:
             m = attached[i]
-            job.mix, job.mix_well = (steps[m]["ul"], steps[m]["cycles"]), target
+            job.mix, job.mix_well = (mix_ul(steps[m], options), steps[m]["cycles"]), target
             job.steps.add(m)
             owner[m] = job
         # a well that changes closes the jobs that would read from it later
@@ -143,6 +143,11 @@ def build_jobs(steps, deck, options):
             uls = [ul for _, ul, _ in job.drops]
             job.loads = plan_loads(uls, job.start_volume, wells[job.source], options, max_ul) or [len(uls)]
     return jobs, moves
+
+
+def mix_ul(step, options):
+    """Rule 7 accepts a mix of at least 90% of the step's volume; a smaller mix is faster."""
+    return round(step["ul"] * options.get("mix_frac", 0.91), 2)
 
 
 def can_join(job, i, before, after, owner, steps, volume, wells, max_ul, options):
@@ -325,6 +330,7 @@ class FastRobot(Robot):
                 zs, volumes, modes = [], [], {}
                 for channel, _, _, ref, ul, jet, empty in group:
                     if empty:
+                        # dm4 empties the tip whatever dv says; dv 0 costs the twin no dispense time
                         plunger, ul = self.held[channel], self.inside[channel]
                     else:
                         plunger = self.plunger(channel, ul)
@@ -335,7 +341,7 @@ class FastRobot(Robot):
                     self.volume[ref] += ul
                     surface = self.bottom(ref) + self.height(ref)
                     zs.append(self.jet_z(ref, surface) if jet else self.floor(ref, mix and mix[0]))
-                    volumes.append(plunger)
+                    volumes.append(0 if empty and self.options.get("dv0", True) else plunger)
                     modes[channel] = 4 if empty else (self.options.get("jet_dm", 2) if jet else 2)
                 fields = self.dispense_fields(group, zs, volumes, 2, mix)
                 dm = " ".join(str(modes.get(ch, next(iter(modes.values())))) for ch in range(8))
@@ -486,7 +492,7 @@ def aspirate(robot, channels, wells, loads, premix=None):
     for channel, ref, load in zip(channels, wells, loads):
         uls = [ul for _, ul, _ in load]
         exact = robot.plunger(channel, sum(uls))
-        robot.exact[channel] = robot.options.get("exact", True) and len(uls) > 1 and exact - sum(robot.plunger(channel, ul) for ul in uls[:-1]) >= 0
+        robot.exact[channel] = robot.options.get("exact", True) and (len(uls) == 1 or exact - sum(robot.plunger(channel, ul) for ul in uls[:-1]) >= 0)
         plunger = exact if robot.exact[channel] or len(uls) == 1 else sum(robot.plunger(channel, ul) for ul in uls)
         targets.append((channel, *robot.xy(ref), ref, plunger, robot.liquid(channel, plunger)))
     for group in split(targets):
