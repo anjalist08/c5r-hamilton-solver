@@ -20,7 +20,7 @@ ROUND_S = 10.0  # pickup + eject + their overhead
 NODE_BUDGET = 400  # exact channel-order search gives up after this many nodes
 
 
-def plan_rounds(pool, robot, greedy, iterations=20000, seed=7):
+def plan_rounds(pool, robot, greedy, iterations=40000, seeds=(7, 11, 23)):
     """Return [(jobs, {id(job): channel})] covering pool, starting from the greedy rounds."""
     xy = {}
 
@@ -34,10 +34,11 @@ def plan_rounds(pool, robot, greedy, iterations=20000, seed=7):
     for extra in (0, 1):
         if len(start) + extra > len(pool):
             continue
-        rounds = anneal([list(r) for r in start] + [[] for _ in range(extra)], where, iterations, random.Random(seed))
-        cost = sum(round_cost(r, where)[0] for r in rounds) + ROUND_S * len(rounds)
-        if best is None or cost < best[0]:
-            best = (cost, rounds)
+        for seed in seeds:
+            rounds = anneal([list(r) for r in start] + [[] for _ in range(extra)], where, iterations, random.Random(seed))
+            cost = sum(round_cost(r, where)[0] for r in rounds) + ROUND_S * sum(1 for r in rounds if r)
+            if cost < best[0]:
+                best = (cost, rounds)
     return [(jobs, round_cost(jobs, where)[1]) for jobs in best[1] if jobs]
 
 
