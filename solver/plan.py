@@ -299,6 +299,14 @@ class FastRobot(Robot):
             nxt = wires[i + 1][:4] if i + 1 < len(wires) else ""
             if op in ("C0AS", "C0DS") and rules.get("te_before_rack") and nxt in ("C0TR",):
                 wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
+            if op in ("C0AS", "C0DS") and rules.get("te_all"):
+                wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
+            if op in ("C0AS", "C0DS") and rules.get("th_all"):
+                wire = re.sub(r"th2450", f"th{limit}", wire, count=1)
+            if op in ("C0AS", "C0DS") and rules.get("te_before_far") and nxt in ("C0AS", "C0DS"):
+                gap = abs(int(re.search(r"xp(\d{5})", wire).group(1)) - int(re.search(r"xp(\d{5})", wires[i + 1]).group(1)))
+                if gap > rules["te_before_far"]:
+                    wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
             if op in ("C0TP", "C0TR") and rules.get("rack_th"):
                 wire = re.sub(r"th2450", f"th{limit}", wire, count=1)
             if op == "C0TR" and rules.get("rack_te"):
@@ -341,7 +349,7 @@ class FastRobot(Robot):
         well = self.wells[ref]
         well_top = well["bottom_z_mm"] + well_depth(well)
         top = self.origin[plate["name"]][2] + min(plate["size_mm"][2], well_top)
-        return math.ceil(max(top - self.options.get("rim_mm", 0.3), surface + 1.5) * 10)
+        return math.ceil(max(top - self.options.get("rim_mm", 0.1), surface + 1.5) * 10)
 
     def eject(self, channels=None):
         """Drop tips in the waste, or by default put each back into the spot it came from."""
@@ -488,7 +496,7 @@ def aspirate(robot, channels, wells, loads, premix=None):
             depth = robot.height(ref) - BELOW_SURFACE_MM
             if depth < FLOOR_MM:
                 raise ValueError(f"{ref} keeps too little liquid to aspirate {liquid:.1f} uL below its surface")
-            z = robot.bottom(ref) + min(robot.options.get("aspirate_mm", 2.0), depth)
+            z = robot.bottom(ref) + min(robot.options.get("aspirate_mm", 99), depth)
             if premix:
                 # the mix runs before the draw: its stroke must stay 0.5 mm under the surface
                 # left while the mix volume is in the tip
