@@ -37,6 +37,7 @@ class Job:
         self.drops = []  # (target, ul, step index)
         self.mix = None  # (ul, cycles): after the last drop, or the whole job for a mix-only job
         self.mix_well = None
+        self.premix = None  # (ul, cycles): mix the source in the first aspirate, before drawing
         self.steps = {first}
         self.order = first
 
@@ -66,10 +67,22 @@ def build_jobs(steps, deck, options):
     wells = protocol.wells(deck)
     max_ul = max_tip_ul(deck)
 
+    # a mix whose well is next aspirated from rides on that aspirate (C0AS mixes first),
+    # so the transfer into the well can stay a quick jet
+    premix = {}  # transfer index -> mix index
+    if options.get("premix", True):
+        for i, step in enumerate(steps):
+            if step["op"] != "mix":
+                continue
+            following = next((j for j in range(i + 1, len(steps)) if step["well"] in protocol.touches(steps[j])[0]), None)
+            if following is not None and steps[following]["op"] == "transfer" and steps[following]["from"] == step["well"]:
+                premix[following] = i
+    premixed = set(premix.values())
+
     attached = {}  # transfer index -> mix index
     last_touch = {}
     for i, step in enumerate(steps):
-        if step["op"] == "mix":
+        if step["op"] == "mix" and i not in premixed:
             prev = last_touch.get(step["well"])
             if prev is not None and steps[prev]["op"] == "transfer" and steps[prev]["to"] == step["well"]:
                 if prev not in attached:
@@ -84,6 +97,9 @@ def build_jobs(steps, deck, options):
             moves.append(i)
             continue
         if step["op"] == "mix":
+            if i in premixed:
+                open_job.pop(step["well"], None)
+                continue
             if any(attached.get(t) == i for t in attached):
                 continue
             job = Job(None, i)
@@ -97,10 +113,17 @@ def build_jobs(steps, deck, options):
         job = open_job.get(source)
         if job is not None and not can_join(job, i, before, after, owner, steps, volume, wells, max_ul, options):
             job = None
+        if job is not None and i in premix:
+            job = None
         if job is None:
             job = Job(source, i)
             job.start_volume = volume[source]
             jobs.append(job)
+            if i in premix:
+                m = premix[i]
+                job.premix = (steps[m]["ul"], steps[m]["cycles"])
+                job.steps.add(m)
+                owner[m] = job
         job.drops.append((target, step["ul"], i))
         job.steps.add(i)
         owner[i] = job
@@ -394,9 +417,9 @@ def run_round(robot, jobs, channel_of):
         if not job.source:
             continue
         seq, start = [], 0
-        for size in job.loads:
+        for n, size in enumerate(job.loads):
             load = job.drops[start : start + size]
-            seq.append(("aspirate", load))
+            seq.append(("aspirate", (load, job.premix if n == 0 else None)))
             for k, (target, ul, _) in enumerate(load):
                 last_of_job = start + k == len(job.drops) - 1
                 mix = job.mix if last_of_job else None
@@ -407,7 +430,8 @@ def run_round(robot, jobs, channel_of):
         now = {c: seq[j] for c, seq in ops.items() if j < len(seq)}
         takers = [c for c, (kind, _) in now.items() if kind == "aspirate"]
         if takers:
-            aspirate(robot, takers, [by_channel[c].source for c in takers], [now[c][1] for c in takers])
+            for premix, group in group_by(takers, lambda c: now[c][1][1]).items():
+                aspirate(robot, group, [by_channel[c].source for c in group], [now[c][1][0] for c in group], premix)
         drops = []
         for c, (kind, (target, ul, mix, last_of_load)) in ((c, op) for c, op in now.items() if op[0] == "drop"):
             # every drop is a jet except one that mixes, which must touch the liquid;
@@ -421,7 +445,7 @@ def run_round(robot, jobs, channel_of):
     robot.eject()
 
 
-def aspirate(robot, channels, wells, loads):
+def aspirate(robot, channels, wells, loads, premix=None):
     """Aspirate for every drop of each job in one command where the arm allows.
 
     A job draws exactly the liquid it delivers when its plunger allows all but
@@ -442,11 +466,22 @@ def aspirate(robot, channels, wells, loads):
             depth = robot.height(ref) - BELOW_SURFACE_MM
             if depth < FLOOR_MM:
                 raise ValueError(f"{ref} keeps too little liquid to aspirate {liquid:.1f} uL below its surface")
-            zs.append(math.floor((robot.bottom(ref) + min(robot.options.get("aspirate_mm", 2.0), depth)) * 10))
+            z = robot.bottom(ref) + min(robot.options.get("aspirate_mm", 2.0), depth)
+            if premix:
+                # the mix runs before the draw: its stroke must stay 0.5 mm under the surface
+                # left while the mix volume is in the tip
+                mixed = robot.bottom(ref) + protocol.liquid_height(robot.wells[ref], robot.volume[ref] + liquid - premix[0])
+                z = min(z, mixed - BELOW_SURFACE_MM)
+                if z < robot.bottom(ref) + FLOOR_MM:
+                    raise ValueError(f"{ref} holds too little liquid to mix {premix[0]} uL before aspirating")
+            zs.append(math.floor(z * 10))
             robot.held[channel] += plunger
             robot.inside[channel] += liquid
             robot.source[channel] = ref
-        robot.send("C0AS", robot.aspirate_fields(group, zs, [p for *_, p, _ in group]))
+        fields = robot.aspirate_fields(group, zs, [p for *_, p, _ in group], premix)
+        if robot.options.get("at1"):
+            fields = fields.replace("at0&", "at1&", 1)
+        robot.send("C0AS", fields)
 
 
 def well_depth(well):
