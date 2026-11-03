@@ -218,6 +218,41 @@ class FastRobot(Robot):
             self.send("C0TP", f"xp{xs}yp{ys}tm{mask}tt{rack['define'][6:8]}tp{top:04d}tz{bottom:04d}th2450td1")
         return name
 
+    def drop(self, drops):
+        """Dispense (channel, well, ul, mix, jet, empty) drops in as few commands as the arm allows."""
+        by_mix = {}
+        for drop in drops:
+            by_mix.setdefault(drop[3] or None, []).append(drop)
+        for mix, same in by_mix.items():
+            targets = [(c, *self.xy(ref), ref, ul, jet, empty) for c, ref, ul, _, jet, empty in same]
+            for group in split(targets):
+                zs, volumes, modes = [], [], {}
+                for channel, _, _, ref, ul, jet, empty in group:
+                    if empty:
+                        plunger, ul = self.held[channel], self.inside[channel]
+                    else:
+                        plunger = self.plunger(channel, ul)
+                        if plunger > self.held[channel] + 1:
+                            raise ValueError(f"channel {channel} holds too little to dispense {ul} uL")
+                    self.held[channel] -= plunger
+                    self.inside[channel] -= ul
+                    self.volume[ref] += ul
+                    surface = self.bottom(ref) + self.height(ref)
+                    zs.append(self.jet_z(ref, surface) if jet else self.floor(ref, mix and mix[0]))
+                    volumes.append(plunger)
+                    modes[channel] = 4 if empty else 2
+                fields = self.dispense_fields(group, zs, volumes, 2, mix)
+                dm = " ".join(str(modes.get(ch, next(iter(modes.values())))) for ch in range(8))
+                self.send("C0DS", fields.replace("dm2&", f"dm{dm}", 1))
+
+    def jet_z(self, ref, surface):
+        mode = self.options.get("jet", "surface")
+        if mode == "top":
+            plate = protocol.plates(self.deck)[ref.split(":")[0]]
+            top = self.origin[plate["name"]][2] + plate["size_mm"][2]
+            return math.ceil((max(top + 1.0, surface + 1.5)) * 10)
+        return math.ceil((surface + 1.5) * 10)
+
     def eject(self, channels=None):
         """Drop tips in the waste, or by default put each back into the spot it came from."""
         if not self.options.get("return", True):
@@ -316,16 +351,15 @@ def run_round(robot, jobs, channel_of):
     depth = max((len(by_channel[c].drops) for c in takers), default=0)
     for k in range(depth):
         active = [c for c in takers if k < len(by_channel[c].drops)]
-        # every drop is a jet except a last drop that mixes, which must touch the liquid
-        mixes = {c: by_channel[c].mix if k == len(by_channel[c].drops) - 1 else None for c in active}
-        for (mix, jet), group in group_by(active, lambda c: (mixes[c], mixes[c] is None)).items():
-            robot.dispense(
-                [by_channel[c].drops[k][0] for c in group],
-                [by_channel[c].drops[k][1] for c in group],
-                group,
-                mix=mix,
-                jet=jet,
-            )
+        drops = []
+        for c in active:
+            job = by_channel[c]
+            last = k == len(job.drops) - 1
+            target, ul, _ = job.drops[k]
+            # every drop is a jet except a last drop that mixes, which must touch the liquid;
+            # an exact-draw tip empties itself (dm4) on its last drop
+            drops.append((c, target, ul, last and job.mix, not (last and job.mix), last and job.exact))
+        robot.drop(drops)
     leftovers = [c for c in takers if robot.inside.get(c, 0) > 0.05]
     if leftovers:
         robot.empty(leftovers)
@@ -333,10 +367,18 @@ def run_round(robot, jobs, channel_of):
 
 
 def aspirate(robot, channels, wells, jobs):
-    """Aspirate for every drop of each job in one command where the arm allows."""
+    """Aspirate for every drop of each job in one command where the arm allows.
+
+    A job draws exactly the liquid it delivers when its plunger allows all but
+    the last drop and the last drop empties the tip (dm4); otherwise it draws
+    the sum of each drop's plunger and empties the rest back afterwards.
+    """
     targets = []
     for channel, ref, job in zip(channels, wells, jobs):
-        plunger = sum(robot.plunger(channel, ul) for _, ul, _ in job.drops)
+        uls = [ul for _, ul, _ in job.drops]
+        exact = robot.plunger(channel, sum(uls))
+        job.exact = robot.options.get("exact", True) and len(uls) > 1 and exact - sum(robot.plunger(channel, ul) for ul in uls[:-1]) >= 0
+        plunger = exact if job.exact or len(uls) == 1 else sum(robot.plunger(channel, ul) for ul in uls)
         targets.append((channel, *robot.xy(ref), ref, plunger, robot.liquid(channel, plunger)))
     for group in split(targets):
         zs = []
@@ -345,7 +387,7 @@ def aspirate(robot, channels, wells, jobs):
             depth = robot.height(ref) - BELOW_SURFACE_MM
             if depth < FLOOR_MM:
                 raise ValueError(f"{ref} keeps too little liquid to aspirate {liquid:.1f} uL below its surface")
-            zs.append(math.floor((robot.bottom(ref) + min(2.0, depth)) * 10))
+            zs.append(math.floor((robot.bottom(ref) + min(robot.options.get("aspirate_mm", 2.0), depth)) * 10))
             robot.held[channel] += plunger
             robot.inside[channel] += liquid
             robot.source[channel] = ref
