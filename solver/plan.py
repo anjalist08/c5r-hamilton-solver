@@ -39,6 +39,7 @@ class Job:
         self.mix = None  # (ul, cycles): after the last drop, or the whole job for a mix-only job
         self.mix_well = None
         self.premix = None  # (ul, cycles): mix the source in the first aspirate, before drawing
+        self.mix_step = None
         self.steps = {first}
         self.order = first
 
@@ -125,17 +126,27 @@ def build_jobs(steps, deck, options):
                 job.premix = (mix_ul(steps[m], options), steps[m]["cycles"])
                 job.steps.add(m)
                 owner[m] = job
+        if job.mix is not None:
+            # split_mix: the previous drop becomes a jet and its mix goes to a fresh mix-only tip
+            m = job.mix_step
+            alone = Job(None, m)
+            alone.mix, alone.mix_well = job.mix, job.mix_well
+            jobs.append(alone)
+            owner[m] = alone
+            job.steps.discard(m)
+            job.mix = job.mix_well = job.mix_step = None
         job.drops.append((target, step["ul"], i))
         job.steps.add(i)
         owner[i] = job
         if i in attached:
             m = attached[i]
             job.mix, job.mix_well = (mix_ul(steps[m], options), steps[m]["cycles"]), target
+            job.mix_step = m
             job.steps.add(m)
             owner[m] = job
         # a well that changes closes the jobs that would read from it later
         open_job.pop(target, None)
-        open_job[source] = None if i in attached else job
+        open_job[source] = job if options.get("split_mix") or i not in attached else None
         volume[source] -= step["ul"]
         volume[target] += step["ul"]
     for job in jobs:
@@ -151,7 +162,7 @@ def mix_ul(step, options):
 
 
 def can_join(job, i, before, after, owner, steps, volume, wells, max_ul, options):
-    if job.mix is not None or not options.get("share", True):
+    if (job.mix is not None and not options.get("split_mix")) or not options.get("share", True):
         return False
     # no step outside the job may sit between a job member and step i
     for p in before[i]:
