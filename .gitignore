@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# The organizers' kit is not ours to redistribute: unzip it here locally.
+kit/
+
+# Generated programs, traces and reports
+out/
+*.trace.jsonl
