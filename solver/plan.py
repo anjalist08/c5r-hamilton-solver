@@ -114,6 +114,10 @@ def build_jobs(steps, deck, options):
         open_job[source] = None if i in attached else job
         volume[source] -= step["ul"]
         volume[target] += step["ul"]
+    for job in jobs:
+        if job.source:
+            uls = [ul for _, ul, _ in job.drops]
+            job.loads = plan_loads(uls, job.start_volume, wells[job.source], options, max_ul) or [len(uls)]
     return jobs, moves
 
 
@@ -125,11 +129,48 @@ def can_join(job, i, before, after, owner, steps, volume, wells, max_ul, options
         if p not in job.steps and any(p in after[member] for member in job.steps):
             return False
     uls = [ul for _, ul, _ in job.drops] + [steps[i]["ul"]]
-    drawn = aspirated(options["deck"], uls, max_ul)
-    if drawn is None:
-        return False
-    height = protocol.liquid_height(wells[job.source], job.start_volume - drawn)
-    return height - BELOW_SURFACE_MM >= FLOOR_MM + 0.05
+    return plan_loads(uls, job.start_volume, wells[job.source], options, max_ul) is not None
+
+
+def plan_loads(uls, start_volume, well, options, max_ul):
+    """Split a tip's drops into loads (one aspirate each); None if they cannot be done.
+
+    One load if a single draw works. Otherwise, with options["multiload"],
+    greedy loads that each draw exactly what they deliver (the last drop of
+    a load empties the tip), so the source is never over-drawn.
+    """
+    deck = options["deck"]
+
+    def deep_enough(left):
+        return protocol.liquid_height(well, left) - BELOW_SURFACE_MM >= FLOOR_MM + 0.05
+
+    drawn = aspirated(deck, uls, max_ul)
+    if drawn is not None and deep_enough(start_volume - drawn):
+        return [len(uls)]
+    if not options.get("multiload", True):
+        return None
+    curves = [c["points"] for c in deck["deck"]["correction_curves"]
+              if not c.get("conditions") and c["tip_capacity_microliters"] <= max_ul * 1.25 + 1]
+    loads, volume, i = [], start_volume, 0
+    while i < len(uls):
+        size = 0
+        while i + size < len(uls):
+            load = uls[i : i + size + 1]
+            fits = [pts for pts in curves if pts[-1][0] >= sum(load)]
+            if not fits or not all(exact_ok(pts, load) for pts in fits) or not deep_enough(volume - sum(load)):
+                break
+            size += 1
+        if size == 0:
+            return None
+        loads.append(size)
+        volume -= sum(uls[i : i + size])
+        i += size
+    return loads
+
+
+def exact_ok(points, uls):
+    """A tip can draw exactly sum(uls) and still jet all but the last drop by plunger."""
+    return to_plunger(points, sum(uls)) - sum(to_plunger(points, ul) for ul in uls[:-1]) >= 0.1
 
 
 def aspirated(deck, uls, max_ul):
@@ -179,6 +220,7 @@ class FastRobot(Robot):
         super().__init__(deck)
         self.options = options
         self.spot = {}
+        self.exact = {}
 
     def pick_row_matched(self, channels, need_ul):
         """One tip per channel, channel c from row c of one rack column if possible."""
@@ -338,35 +380,45 @@ def run_round(robot, jobs, channel_of):
     robot.pick_row_matched(channels, need)
     by_channel = {channel_of[id(job)]: job for job in jobs}
 
-    takers = [c for c, job in by_channel.items() if job.source]
-    if takers:
-        wells = [by_channel[c].source for c in takers]
-        doses = [len(by_channel[c].drops) for c in takers]
-        aspirate(robot, takers, wells, [by_channel[c] for c in takers])
     mixers = [c for c, job in by_channel.items() if not job.source]
     if mixers:
         for mix, group in group_by(mixers, lambda c: by_channel[c].mix).items():
             robot.mix([by_channel[c].mix_well for c in group], mix[0], mix[1], group)
 
-    depth = max((len(by_channel[c].drops) for c in takers), default=0)
-    for k in range(depth):
-        active = [c for c in takers if k < len(by_channel[c].drops)]
+    # each tip: per load, one aspirate then its drops; channels step through ops together
+    ops = {}
+    for c, job in by_channel.items():
+        if not job.source:
+            continue
+        seq, start = [], 0
+        for size in job.loads:
+            load = job.drops[start : start + size]
+            seq.append(("aspirate", load))
+            for k, (target, ul, _) in enumerate(load):
+                last_of_job = start + k == len(job.drops) - 1
+                mix = job.mix if last_of_job else None
+                seq.append(("drop", (target, ul, mix, k == size - 1)))
+            start += size
+        ops[c] = seq
+    for j in range(max((len(seq) for seq in ops.values()), default=0)):
+        now = {c: seq[j] for c, seq in ops.items() if j < len(seq)}
+        takers = [c for c, (kind, _) in now.items() if kind == "aspirate"]
+        if takers:
+            aspirate(robot, takers, [by_channel[c].source for c in takers], [now[c][1] for c in takers])
         drops = []
-        for c in active:
-            job = by_channel[c]
-            last = k == len(job.drops) - 1
-            target, ul, _ = job.drops[k]
-            # every drop is a jet except a last drop that mixes, which must touch the liquid;
-            # an exact-draw tip empties itself (dm4) on its last drop
-            drops.append((c, target, ul, last and job.mix, not (last and job.mix), last and job.exact))
-        robot.drop(drops)
-    leftovers = [c for c in takers if robot.inside.get(c, 0) > 0.05]
+        for c, (kind, (target, ul, mix, last_of_load)) in ((c, op) for c, op in now.items() if op[0] == "drop"):
+            # every drop is a jet except one that mixes, which must touch the liquid;
+            # an exact-draw load empties the tip (dm4) on its last drop
+            drops.append((c, target, ul, mix, not mix, last_of_load and robot.exact.get(c, False)))
+        if drops:
+            robot.drop(drops)
+    leftovers = [c for c in ops if robot.inside.get(c, 0) > 0.05]
     if leftovers:
         robot.empty(leftovers)
     robot.eject()
 
 
-def aspirate(robot, channels, wells, jobs):
+def aspirate(robot, channels, wells, loads):
     """Aspirate for every drop of each job in one command where the arm allows.
 
     A job draws exactly the liquid it delivers when its plunger allows all but
@@ -374,11 +426,11 @@ def aspirate(robot, channels, wells, jobs):
     the sum of each drop's plunger and empties the rest back afterwards.
     """
     targets = []
-    for channel, ref, job in zip(channels, wells, jobs):
-        uls = [ul for _, ul, _ in job.drops]
+    for channel, ref, load in zip(channels, wells, loads):
+        uls = [ul for _, ul, _ in load]
         exact = robot.plunger(channel, sum(uls))
-        job.exact = robot.options.get("exact", True) and len(uls) > 1 and exact - sum(robot.plunger(channel, ul) for ul in uls[:-1]) >= 0
-        plunger = exact if job.exact or len(uls) == 1 else sum(robot.plunger(channel, ul) for ul in uls)
+        robot.exact[channel] = robot.options.get("exact", True) and len(uls) > 1 and exact - sum(robot.plunger(channel, ul) for ul in uls[:-1]) >= 0
+        plunger = exact if robot.exact[channel] or len(uls) == 1 else sum(robot.plunger(channel, ul) for ul in uls)
         targets.append((channel, *robot.xy(ref), ref, plunger, robot.liquid(channel, plunger)))
     for group in split(targets):
         zs = []
@@ -397,7 +449,8 @@ def aspirate(robot, channels, wells, jobs):
 def job_ul(job):
     if not job.source:
         return job.mix[0]
-    return max(sum(ul for _, ul, _ in job.drops) * 1.1, job.mix[0] if job.mix else 0)
+    biggest = max(sum(ul for _, ul, _ in job.drops[sum(job.loads[:i]) : sum(job.loads[: i + 1])]) for i in range(len(job.loads)))
+    return max(biggest * 1.1, job.mix[0] if job.mix else 0)
 
 
 def group_by(items, key):
