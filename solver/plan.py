@@ -19,10 +19,14 @@ cannot reach their wells at once.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 
 from speedrun import protocol
 from speedrun.robot import BELOW_SURFACE_MM, FLOOR_MM, Robot, split
+
+from .rounds import plan_rounds
 
 ROWS = "ABCDEFGHIJKLMNOP"
 
@@ -46,7 +50,7 @@ class Job:
 
 
 def solve(loaded, deck, options=None):
-    options = {**(options or {}), "deck": deck}
+    options = {**json.loads(os.environ.get("SOLVER_OPTS", "{}")), **(options or {}), "deck": deck}
     steps = loaded["steps"]
     jobs, moves = build_jobs(steps, deck, options)
     return schedule(steps, jobs, moves, deck, options)
@@ -214,6 +218,24 @@ class FastRobot(Robot):
             self.send("C0TP", f"xp{xs}yp{ys}tm{mask}tt{rack['define'][6:8]}tp{top:04d}tz{bottom:04d}th2450td1")
         return name
 
+    def eject(self, channels=None):
+        """Drop tips in the waste, or by default put each back into the spot it came from."""
+        if not self.options.get("return", True):
+            return super().eject(channels)
+        channels = sorted(self.tip if channels is None else channels)
+        from speedrun.robot import lists
+
+        for name in {self.spot[c][0] for c in channels}:
+            rack = self.racks[name]
+            top, bottom = round(rack["top_z_mm"] * 10), round((rack["top_z_mm"] - rack["stroke_mm"]) * 10)
+            targets = [(c, self.spot[c][1], self.spot[c][2]) for c in channels if self.spot[c][0] == name]
+            for group in split(targets):
+                xs, ys, mask = lists(group, 1, 2)
+                self.send("C0TR", f"xp{xs}yp{ys}tp{top:04d}tz{bottom:04d}th2450te2450tm{mask}ti1")
+        for channel in channels:
+            for state in (self.tip, self.held, self.inside, self.source, self.spot):
+                state.pop(channel, None)
+
 
 def schedule(steps, jobs, moves, deck, options):
     before = protocol.predecessors(steps)
@@ -233,12 +255,24 @@ def schedule(steps, jobs, moves, deck, options):
         if not ready:
             raise ValueError("deadlock: no job is ready")
         ready.sort(key=lambda job: job.order)
-        chosen, channel_of = pick_round(ready)
-        run_round(robot, chosen, channel_of)
-        for job in chosen:
-            done |= job.steps
-            pending.remove(job)
+        batch = greedy_rounds(ready)
+        if len(ready) > 8 and options.get("anneal", True):
+            batch = plan_rounds(ready, robot, batch)
+        for chosen, channel_of in batch:
+            run_round(robot, chosen, channel_of)
+            for job in chosen:
+                done |= job.steps
+                pending.remove(job)
     return robot.program()
+
+
+def greedy_rounds(ready):
+    rounds, left = [], list(ready)
+    while left:
+        chosen, channel_of = pick_round(left)
+        rounds.append((chosen, channel_of))
+        left = [job for job in left if job not in chosen]
+    return rounds
 
 
 def pick_round(ready):
