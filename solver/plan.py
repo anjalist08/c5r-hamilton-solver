@@ -331,6 +331,8 @@ class FastRobot(Robot):
             if op == "C0TR" and rules.get("rack_te"):
                 wire = re.sub(r"te2450", f"te{limit}", wire, count=1)
             wires[i] = wire
+        if self.options.get("nudge", 2):
+            wires = nudge(wires, self.options.get("nudge", 2), self.options.get("nudge_rack", 0))
         return "".join(wire + "\n" for wire in wires)
 
     def drop(self, drops):
@@ -532,6 +534,50 @@ def aspirate(robot, channels, wells, loads, premix=None):
         if robot.options.get("at1"):
             fields = fields.replace("at0&", "at1&", 1)
         robot.send("C0AS", fields)
+
+
+def _list(wire, field):
+    m = re.search(rf"(?<=[0-9&]){field}([0-9 ]+)(&?)", wire)
+    values = m.group(1).split()
+    return m, (values + [values[-1]] * 8)[:8]
+
+
+def nudge(wires, step, rack_step):
+    """Micro-moves: shift each command's X (and each channel's Y) up to `step` tenths of a mm
+    toward where the arm and that channel come from. Well positions allow 0.3 mm."""
+    last_x, last_y = None, [None] * 8
+    out = []
+    for wire in wires:
+        op = wire[:4]
+        if op in ("C0AS", "C0DS", "C0TP", "C0TR") and "xp" in wire:
+            limit = step if op in ("C0AS", "C0DS") else rack_step
+            mx, xs = _list(wire, "xp")
+            my, ys = _list(wire, "yp")
+            _, mask = _list(wire, "tm")
+            if limit and last_x is not None and len(set(xs)) == 1:
+                x = int(xs[0])
+                x += max(-limit, min(limit, last_x - x))
+                width = len(xs[0])
+                wire = wire[: mx.start(1)] + " ".join([f"{x:0{width}d}"] * 8) + wire[mx.end(2) :]
+                xs = [f"{x:0{width}d}"] * 8
+                my, ys = _list(wire, "yp")
+                new_y = []
+                for ch, y in enumerate(ys):
+                    v = int(y)
+                    if mask[ch] == "1" and last_y[ch] is not None:
+                        v += max(-limit, min(limit, last_y[ch] - v))
+                    new_y.append(v)
+                # neighbours must stay at least 9 mm apart in Y
+                if all(a - b >= 90 for a, b in zip(new_y, new_y[1:])):
+                    wire = wire[: my.start(1)] + " ".join(f"{v:04d}" for v in new_y) + wire[my.end(2) :]
+                    ys = [f"{v:04d}" for v in new_y]
+            if len(set(xs)) == 1:
+                last_x = int(xs[0])
+            for ch in range(8):
+                if mask[ch] == "1":
+                    last_y[ch] = int(ys[ch])
+        out.append(wire)
+    return out
 
 
 def well_depth(well):
