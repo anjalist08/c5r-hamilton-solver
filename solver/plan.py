@@ -246,11 +246,11 @@ class FastRobot(Robot):
                 self.send("C0DS", fields.replace("dm2&", f"dm{dm}", 1))
 
     def jet_z(self, ref, surface):
-        mode = self.options.get("jet", "surface")
+        mode = self.options.get("jet", "top")
         if mode == "top":
             plate = protocol.plates(self.deck)[ref.split(":")[0]]
             top = self.origin[plate["name"]][2] + plate["size_mm"][2]
-            return math.ceil((max(top + 1.0, surface + 1.5)) * 10)
+            return math.ceil((max(top - self.options.get("rim_mm", 3.0), surface + 1.5)) * 10)
         return math.ceil((surface + 1.5) * 10)
 
     def eject(self, channels=None):
