@@ -273,7 +273,7 @@ class FastRobot(Robot):
         )
         for name in fitting:
             free = set(self.free[name])
-            for column in range(12):
+            for column in (range(11, -1, -1) if self.options.get("tips_reverse") else range(12)):
                 if all((column, c) in free for c in channels):
                     return self.take(name, [(c, column, c) for c in channels])
         for name in fitting:
@@ -413,6 +413,9 @@ def schedule(steps, jobs, moves, deck, options):
         batch = greedy_rounds(ready)
         if len(ready) > 8 and options.get("anneal", True):
             batch = plan_rounds(ready, robot, batch)
+        if options.get("rounds_reverse"):
+            # independent rounds may run in any order: start at the plate columns nearest the rack
+            batch = list(reversed(batch))
         for chosen, channel_of in batch:
             run_round(robot, chosen, channel_of)
             for job in chosen:

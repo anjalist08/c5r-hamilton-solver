@@ -20,6 +20,8 @@ CONFIGS = [
     {"split_mix": True},
     {"small_first": True},
     {"split_mix": True, "small_first": True},
+    {"rounds_reverse": True},
+    {"split_mix": True, "rounds_reverse": True},
     {"premix": False},
     {"multiload": False},
 ]
