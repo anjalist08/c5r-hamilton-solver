@@ -9,5 +9,3 @@ kit/
 out/
 *.trace.jsonl
 
-# Best program per protocol, for submitting
-submissions/
