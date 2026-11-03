@@ -9,3 +9,7 @@ kit/
 out/
 *.trace.jsonl
 
+
+# Team token for the hackathon site (never commit)
+.team-token
+submissions/submitted.json

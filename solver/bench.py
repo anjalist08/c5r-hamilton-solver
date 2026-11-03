@@ -50,6 +50,10 @@ def bench(args):
         else:
             print(f"{name:18}  INVALID  " + "\n    ".join(report["failures"][:8]))
     print(f"{'total':18} {total:8.1f} s")
+    if getattr(args, "submit", False) and improved:
+        from . import submit
+
+        submit.main(improved)
     return 0 if all(report["valid"] for _, report, _ in results) else 1
 
 
